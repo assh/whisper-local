@@ -278,11 +278,23 @@ def trello_ping(current: User = Depends(require_user)):
     key, tok = get_trello_creds(current)
     url = f"https://api.trello.com/1/members/me?key={key}&token={tok}"
     with httpx.Client(timeout=10) as client:
-        r = client.get(url)
-        data = r.json()
+        r = client.get(url, headers={"Accept": "application/json"})
+        try:
+            data = r.json()
+        except Exception:
+            data = None
     if r.status_code != 200:
-        raise HTTPException(status_code=r.status_code, detail=data.get("message") or "Trello auth failed")
-    return {"ok": True, "me": {k: data.get(k) for k in ("id", "username", "fullName")}}
+        detail = None
+        if isinstance(data, dict):
+            detail = data.get("message") or data.get("error")
+        if not detail:
+            # Fall back to raw text (trim to keep it readable)
+            try:
+                detail = (r.text or "").strip()[:200] or "Trello auth failed"
+            except Exception:
+                detail = "Trello auth failed"
+        raise HTTPException(status_code=r.status_code, detail=detail)
+    return {"ok": True, "me": {k: (data or {}).get(k) for k in ("id", "username", "fullName")}}
 
 class CommentIn(BaseModel):
     cardInput: str
@@ -299,10 +311,22 @@ def trello_comment(payload: CommentIn, current: User = Depends(require_user)):
     url = f"https://api.trello.com/1/cards/{card_id}/actions/comments"
     params = {"key": key, "token": tok, "text": payload.text.strip()}
     with httpx.Client(timeout=15) as client:
-        r = client.post(url, params=params)
-        data = r.json()
+        r = client.post(url, params=params, headers={"Accept": "application/json"})
+        try:
+            data = r.json()
+        except Exception:
+            data = None
     if r.status_code != 200:
-        msg = data.get("message") or data.get("error") or f"Trello error {r.status_code}"
+        msg = None
+        if isinstance(data, dict):
+            msg = data.get("message") or data.get("error")
+        if not msg:
+            try:
+                msg = (r.text or "").strip()[:200]
+            except Exception:
+                msg = None
+        if not msg:
+            msg = f"Trello error {r.status_code}"
         raise HTTPException(status_code=r.status_code, detail=msg)
     return {"ok": True, "data": data}
 
@@ -325,18 +349,44 @@ def trello_checklist_merge(payload: ChecklistMergeIn, current: User = Depends(re
     url_lists = f"https://api.trello.com/1/cards/{card_id}/checklists"
     params = {"key": key, "token": tok}
     with httpx.Client(timeout=15) as client:
-        rl = client.get(url_lists, params=params)
-        list_data = rl.json()
+        rl = client.get(url_lists, params=params, headers={"Accept": "application/json"})
+        try:
+            list_data = rl.json()
+        except Exception:
+            list_data = None
         if rl.status_code != 200:
-            raise HTTPException(status_code=rl.status_code, detail=list_data.get("message") or "Failed to read card checklists.")
+            detail = None
+            if isinstance(list_data, dict):
+                detail = list_data.get("message") or list_data.get("error")
+            if not detail:
+                try:
+                    detail = (rl.text or "").strip()[:200]
+                except Exception:
+                    detail = None
+            raise HTTPException(status_code=rl.status_code, detail=detail or "Failed to read card checklists.")
         # Assume at most 1 checklist; create if none
         checklist = list_data[0] if isinstance(list_data, list) and list_data else None
         if not checklist:
             url_create = "https://api.trello.com/1/checklists"
-            rc = client.post(url_create, params={"key": key, "token": tok, "idCard": card_id, "name": payload.checklistName or "Checklist"})
-            create_data = rc.json()
+            rc = client.post(
+                url_create,
+                params={"key": key, "token": tok, "idCard": card_id, "name": payload.checklistName or "Checklist"},
+                headers={"Accept": "application/json"},
+            )
+            try:
+                create_data = rc.json()
+            except Exception:
+                create_data = None
             if rc.status_code != 200:
-                raise HTTPException(status_code=rc.status_code, detail=create_data.get("message") or "Failed to create checklist.")
+                detail = None
+                if isinstance(create_data, dict):
+                    detail = create_data.get("message") or create_data.get("error")
+                if not detail:
+                    try:
+                        detail = (rc.text or "").strip()[:200]
+                    except Exception:
+                        detail = None
+                raise HTTPException(status_code=rc.status_code, detail=detail or "Failed to create checklist.")
             checklist = create_data
 
         checklist_id = checklist["id"]
