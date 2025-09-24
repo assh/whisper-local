@@ -73,11 +73,28 @@ class User(SQLModel, table=True):
     notion_summary_page: Optional[str] = None   # full URL or page ID
     notion_checklist_page: Optional[str] = None # full URL or page ID
 
+# ---- replace your existing UserCreate with this ----
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
     name: Optional[str] = "User"
     inviteCode: Optional[str] = None
+
+    # NEW: allow setting Notion during registration (MVP)
+    notionApiKey: Optional[str] = None
+    notionSummaryPage: Optional[str] = None
+    notionChecklistPage: Optional[str] = None
+
+# ---- add this helper near your models/helpers (once) ----
+def build_defaults(u: "User") -> dict:
+    return {
+        # Trello (existing)
+        "summaryCard": u.summary_card,
+        "checklistCard": u.checklist_card,
+        # Notion (new)
+        "notionSummaryPage": u.notion_summary_page,
+        "notionChecklistPage": u.notion_checklist_page,
+    }
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -145,6 +162,7 @@ def require_user(authorization: str | None = Header(None)) -> User:
 # -----------------------
 # Auth endpoints
 # -----------------------
+# ---- replace your /auth/register with this version ----
 @app.post("/auth/register", response_model=dict)
 def register(payload: UserCreate):
     if INVITE_CODE and payload.inviteCode != INVITE_CODE:
@@ -153,16 +171,23 @@ def register(payload: UserCreate):
         exists = s.exec(select(User).where(User.email == payload.email)).first()
         if exists:
             raise HTTPException(status_code=409, detail="Email already registered")
+
         user = User(
             email=payload.email,
             password_hash=hash_pw(payload.password),
             name=payload.name or "User",
+
+            # NEW: capture Notion creds/presets at signup (MVP: plain text)
+            notion_api_key=(payload.notionApiKey or None),
+            notion_summary_page=(payload.notionSummaryPage or None),
+            notion_checklist_page=(payload.notionChecklistPage or None),
         )
         s.add(user)
         s.commit()
         s.refresh(user)
         return {"ok": True, "id": user.id}
 
+# ---- replace your /auth/login with this version ----
 @app.post("/auth/login", response_model=TokenOut)
 def login(payload: UserLogin):
     with Session(engine) as s:
@@ -176,17 +201,18 @@ def login(payload: UserLogin):
             id=user.id,
             email=user.email,
             name=user.name,
-            defaults={"summaryCard": user.summary_card, "checklistCard": user.checklist_card},
+            defaults=build_defaults(user),
         ),
     )
 
+# ---- replace your /me with this version ----
 @app.get("/me", response_model=UserOut)
 def me(current: User = Depends(require_user)):
     return UserOut(
         id=current.id,
         email=current.email,
         name=current.name,
-        defaults={"summaryCard": current.summary_card, "checklistCard": current.checklist_card},
+        defaults=build_defaults(current),
     )
 
 # -----------------------
@@ -196,6 +222,7 @@ class PresetsIn(BaseModel):
     summaryCard: Optional[str] = None
     checklistCard: Optional[str] = None
 
+# ---- replace your /me/presets return with this block ----
 @app.post("/me/presets", response_model=UserOut)
 def update_presets(presets: PresetsIn, current: User = Depends(require_user)):
     with Session(engine) as s:
@@ -211,7 +238,7 @@ def update_presets(presets: PresetsIn, current: User = Depends(require_user)):
             id=user.id,
             email=user.email,
             name=user.name,
-            defaults={"summaryCard": user.summary_card, "checklistCard": user.checklist_card},
+            defaults=build_defaults(user),  # now includes Notion fields too
         )
 
 # -----------------------
@@ -387,7 +414,7 @@ def notion_summary(payload: NotionSummaryIn, current: User = Depends(require_use
     if payload.summary:
         blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type":"text","text":{"content": payload.summary[:1900]}}]}})
     if payload.blockers:
-        blocks.append({"type": "heading_4", "heading_4": {"rich_text": [{"type":"text","text":{"content":"Blockers"}}]}})
+        blocks.append({"type": "heading_3", "heading_3": {"rich_text": [{"type":"text","text":{"content":"Blockers"}}]}})
         blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type":"text","text":{"content": payload.blockers[:1900]}}]}})
     if payload.trelloCard:
         blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type":"text","text":{"content":"Trello: "}}, {"type":"text","text":{"content": payload.trelloCard, "link": {"url": payload.trelloCard}}}]}})
