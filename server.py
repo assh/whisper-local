@@ -6,7 +6,7 @@ from pydantic import BaseModel, EmailStr
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from passlib.context import CryptContext
 import jwt, os, tempfile, datetime as dt
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import httpx
 from dotenv import load_dotenv
 from pathlib import Path
@@ -68,11 +68,33 @@ class User(SQLModel, table=True):
     trello_api_key: Optional[str] = None
     trello_token: Optional[str] = None
 
+    # --- Notion (MVP, page-based like Trello cards) ---
+    notion_api_key: Optional[str] = None
+    notion_summary_page: Optional[str] = None   # full URL or page ID
+    notion_checklist_page: Optional[str] = None # full URL or page ID
+
+# ---- replace your existing UserCreate with this ----
 class UserCreate(BaseModel):
     email: EmailStr
     password: str
     name: Optional[str] = "User"
     inviteCode: Optional[str] = None
+
+    # NEW: allow setting Notion during registration (MVP)
+    notionApiKey: Optional[str] = None
+    notionSummaryPage: Optional[str] = None
+    notionChecklistPage: Optional[str] = None
+
+# ---- add this helper near your models/helpers (once) ----
+def build_defaults(u: "User") -> dict:
+    return {
+        # Trello (existing)
+        "summaryCard": u.summary_card,
+        "checklistCard": u.checklist_card,
+        # Notion (new)
+        "notionSummaryPage": u.notion_summary_page,
+        "notionChecklistPage": u.notion_checklist_page,
+    }
 
 class UserLogin(BaseModel):
     email: EmailStr
@@ -140,6 +162,7 @@ def require_user(authorization: str | None = Header(None)) -> User:
 # -----------------------
 # Auth endpoints
 # -----------------------
+# ---- replace your /auth/register with this version ----
 @app.post("/auth/register", response_model=dict)
 def register(payload: UserCreate):
     if INVITE_CODE and payload.inviteCode != INVITE_CODE:
@@ -148,16 +171,23 @@ def register(payload: UserCreate):
         exists = s.exec(select(User).where(User.email == payload.email)).first()
         if exists:
             raise HTTPException(status_code=409, detail="Email already registered")
+
         user = User(
             email=payload.email,
             password_hash=hash_pw(payload.password),
             name=payload.name or "User",
+
+            # NEW: capture Notion creds/presets at signup (MVP: plain text)
+            notion_api_key=(payload.notionApiKey or None),
+            notion_summary_page=(payload.notionSummaryPage or None),
+            notion_checklist_page=(payload.notionChecklistPage or None),
         )
         s.add(user)
         s.commit()
         s.refresh(user)
         return {"ok": True, "id": user.id}
 
+# ---- replace your /auth/login with this version ----
 @app.post("/auth/login", response_model=TokenOut)
 def login(payload: UserLogin):
     with Session(engine) as s:
@@ -171,17 +201,18 @@ def login(payload: UserLogin):
             id=user.id,
             email=user.email,
             name=user.name,
-            defaults={"summaryCard": user.summary_card, "checklistCard": user.checklist_card},
+            defaults=build_defaults(user),
         ),
     )
 
+# ---- replace your /me with this version ----
 @app.get("/me", response_model=UserOut)
 def me(current: User = Depends(require_user)):
     return UserOut(
         id=current.id,
         email=current.email,
         name=current.name,
-        defaults={"summaryCard": current.summary_card, "checklistCard": current.checklist_card},
+        defaults=build_defaults(current),
     )
 
 # -----------------------
@@ -191,6 +222,7 @@ class PresetsIn(BaseModel):
     summaryCard: Optional[str] = None
     checklistCard: Optional[str] = None
 
+# ---- replace your /me/presets return with this block ----
 @app.post("/me/presets", response_model=UserOut)
 def update_presets(presets: PresetsIn, current: User = Depends(require_user)):
     with Session(engine) as s:
@@ -206,7 +238,7 @@ def update_presets(presets: PresetsIn, current: User = Depends(require_user)):
             id=user.id,
             email=user.email,
             name=user.name,
-            defaults={"summaryCard": user.summary_card, "checklistCard": user.checklist_card},
+            defaults=build_defaults(user),  # now includes Notion fields too
         )
 
 # -----------------------
@@ -255,6 +287,201 @@ def get_trello_creds(current: User) -> Tuple[str, str]:
     if not key or not tok:
         raise HTTPException(status_code=500, detail="Missing Trello key/token for this user (or env fallback).")
     return key, tok
+
+# -----------------------
+# Notion helpers & routes (PAGE-based, mirrors Trello "card" flow)
+# -----------------------
+import re
+
+# Extract a Notion page ID (with or without hyphens) from a URL or raw id
+def parse_notion_page_id(val: Optional[str]) -> Optional[str]:
+    if not val:
+        return None
+    t = val.strip()
+    # match a 32-hex id with or without hyphens at the end of URL or standalone
+    m = re.search(r"([0-9a-fA-F]{32})$", t.replace('-', ''))
+    if m:
+        raw = m.group(1).lower()
+        # re-hyphenate to 8-4-4-4-12
+        return f"{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}-{raw[20:32]}"
+    # handle already hyphenated uuid in string
+    m2 = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", t)
+    if m2:
+        return m2.group(1).lower()
+    return None
+
+class NotionCredsIn(BaseModel):
+    apiKey: str
+    summaryPage: Optional[str] = None   # URL or page id
+    checklistPage: Optional[str] = None # URL or page id
+
+class NotionSummaryIn(BaseModel):
+    pageInput: Optional[str] = None  # override; otherwise use preset
+    title: Optional[str] = None
+    summary: str
+    blockers: Optional[str] = None
+    date: Optional[str] = None  # ISO date (YYYY-MM-DD)
+    trelloCard: Optional[str] = None
+
+class NotionChecklistIn(BaseModel):
+    pageInput: Optional[str] = None  # override; otherwise use preset
+    items: List[str]
+    dedupe: bool = True  # attempt to avoid duplicates by existing to_do text
+
+def get_notion_creds_and_pages(current: User) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    Return (api_key, summary_page_id, checklist_page_id) using per-user values with optional env fallbacks.
+    For env fallbacks, support NOTION_SUMMARY_PAGE / NOTION_CHECKLIST_PAGE.
+    """
+    api_key = (current.notion_api_key or os.getenv("NOTION_API_KEY") or "").strip()
+    summary_page = parse_notion_page_id(current.notion_summary_page or os.getenv("NOTION_SUMMARY_PAGE"))
+    checklist_page = parse_notion_page_id(current.notion_checklist_page or os.getenv("NOTION_CHECKLIST_PAGE"))
+    if not api_key:
+        raise HTTPException(status_code=500, detail="Missing Notion API key for this user (or env fallback).")
+    return api_key, summary_page, checklist_page
+
+def notion_headers(token: str) -> dict:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+@app.post("/me/notion", response_model=dict)
+def set_notion_creds(creds: NotionCredsIn, current: User = Depends(require_user)):
+    with Session(engine) as s:
+        u = s.get(User, current.id)
+        u.notion_api_key = creds.apiKey.strip()
+        if creds.summaryPage is not None:
+            u.notion_summary_page = creds.summaryPage.strip() or None
+        if creds.checklistPage is not None:
+            u.notion_checklist_page = creds.checklistPage.strip() or None
+        s.add(u); s.commit()
+    return {"ok": True}
+
+@app.get("/me/notion", response_model=dict)
+def get_notion_creds_masked(current: User = Depends(require_user)):
+    k = (current.notion_api_key or "").strip()
+    return {
+        "apiKey": (k[:4] + "…" + k[-4:]) if k else None,
+        "summaryPage": current.notion_summary_page,
+        "checklistPage": current.notion_checklist_page,
+    }
+
+@app.delete("/me/notion", response_model=dict)
+def clear_notion_creds(current: User = Depends(require_user)):
+    with Session(engine) as s:
+        u = s.get(User, current.id)
+        u.notion_api_key = None
+        u.notion_summary_page = None
+        u.notion_checklist_page = None
+        s.add(u); s.commit()
+    return {"ok": True}
+
+@app.get("/notion/ping", response_model=dict)
+def notion_ping(current: User = Depends(require_user)):
+    token, summary_page, checklist_page = get_notion_creds_and_pages(current)
+    with httpx.Client(timeout=15) as client:
+        r = client.get("https://api.notion.com/v1/users/me", headers=notion_headers(token))
+        try:
+            me = r.json()
+        except Exception:
+            me = None
+        if r.status_code != 200:
+            msg = (isinstance(me, dict) and (me.get("message") or me.get("error"))) or "Notion auth failed"
+            raise HTTPException(status_code=r.status_code, detail=msg)
+        # Optionally verify page access if presets exist
+        pages_ok = {}
+        for label, pid in (("summary", summary_page), ("checklist", checklist_page)):
+            if not pid:
+                pages_ok[label] = None
+                continue
+            rp = client.get(f"https://api.notion.com/v1/pages/{pid}", headers=notion_headers(token))
+            pages_ok[label] = (rp.status_code == 200)
+    return {"ok": True, "me": {"name": (me or {}).get("name"), "id": (me or {}).get("id")}, "pages": pages_ok}
+
+@app.post("/notion/summary", response_model=dict)
+def notion_summary(payload: NotionSummaryIn, current: User = Depends(require_user)):
+    token, preset_summary_page, _ = get_notion_creds_and_pages(current)
+    page_id = parse_notion_page_id(payload.pageInput) or preset_summary_page
+    if not page_id:
+        raise HTTPException(status_code=400, detail="No Notion page provided for summary (set preset or pass pageInput).")
+    # Compose content blocks similar to Trello comment
+    blocks = []
+    title = payload.title or f"Daily Summary {dt.datetime.utcnow().date().isoformat()}"
+    blocks.append({"type": "heading_3", "heading_3": {"rich_text": [{"type": "text", "text": {"content": title}}]}})
+    if payload.summary:
+        blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type":"text","text":{"content": payload.summary[:1900]}}]}})
+    if payload.blockers:
+        blocks.append({"type": "heading_3", "heading_3": {"rich_text": [{"type":"text","text":{"content":"Blockers"}}]}})
+        blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type":"text","text":{"content": payload.blockers[:1900]}}]}})
+    if payload.trelloCard:
+        blocks.append({"type": "paragraph", "paragraph": {"rich_text": [{"type":"text","text":{"content":"Trello: "}}, {"type":"text","text":{"content": payload.trelloCard, "link": {"url": payload.trelloCard}}}]}})
+    with httpx.Client(timeout=20) as client:
+        r = client.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=notion_headers(token),
+            json={"children": blocks},
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+    if r.status_code not in (200, 201):
+        msg = (isinstance(data, dict) and (data.get("message") or data.get("error"))) or "Failed to append to Notion page."
+        raise HTTPException(status_code=r.status_code, detail=msg)
+    return {"ok": True, "pageId": page_id, "appended": len(blocks)}
+
+@app.post("/notion/checklist/merge", response_model=dict)
+def notion_checklist_merge(payload: NotionChecklistIn, current: User = Depends(require_user)):
+    token, _, preset_checklist_page = get_notion_creds_and_pages(current)
+    page_id = parse_notion_page_id(payload.pageInput) or preset_checklist_page
+    if not page_id:
+        raise HTTPException(status_code=400, detail="No Notion page provided for checklist (set preset or pass pageInput).")
+    items = [s.strip() for s in (payload.items or []) if s and s.strip()]
+    if not items:
+        raise HTTPException(status_code=400, detail="No checklist items provided.")
+    dedupe_set = set()
+    if payload.dedupe:
+        # fetch first 200 child blocks and collect existing to_do text to avoid duplicates
+        with httpx.Client(timeout=20) as client:
+            rr = client.get(f"https://api.notion.com/v1/blocks/{page_id}/children?page_size=200", headers=notion_headers(token))
+            if rr.status_code == 200:
+                try:
+                    children = rr.json().get("results", [])
+                except Exception:
+                    children = []
+                for b in children:
+                    if b.get("type") == "to_do":
+                        txt = "".join([span.get("plain_text","") for span in b.get("to_do",{}).get("rich_text",[])]).strip().lower()
+                        if txt:
+                            dedupe_set.add(txt)
+    new_blocks = []
+    added, skipped = 0, 0
+    for it in items:
+        key = it.lower()
+        if key in dedupe_set:
+            skipped += 1
+            continue
+        new_blocks.append({"type":"to_do","to_do":{"rich_text":[{"type":"text","text":{"content":it}}],"checked":False}})
+        added += 1
+    if not new_blocks:
+        return {"ok": True, "mode": "merge", "pageId": page_id, "added": 0, "skipped": skipped}
+    with httpx.Client(timeout=20) as client:
+        r = client.patch(
+            f"https://api.notion.com/v1/blocks/{page_id}/children",
+            headers=notion_headers(token),
+            json={"children": new_blocks},
+        )
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+    if r.status_code not in (200, 201):
+        msg = (isinstance(data, dict) and (data.get("message") or data.get("error"))) or "Failed to append checklist to Notion page."
+        raise HTTPException(status_code=r.status_code, detail=msg)
+    return {"ok": True, "mode": "merge", "pageId": page_id, "added": added, "skipped": skipped}
 
 # -----------------------
 # Trello helpers & routes
@@ -422,7 +649,10 @@ def debug_env():
         "AUTH_DB_URL": os.getenv("AUTH_DB_URL"),
         "AUTH_TTL_MIN": os.getenv("AUTH_TTL_MIN"),
         "TRELLO_KEY_set": bool(os.getenv("TRELLO_KEY")),
-        "TRELLO_TOKEN_set": bool(os.getenv("TRELLO_TOKEN"))
+        "TRELLO_TOKEN_set": bool(os.getenv("TRELLO_TOKEN")),
+        "NOTION_API_KEY_set": bool(os.getenv("NOTION_API_KEY")),
+        "NOTION_SUMMARY_PAGE_set": bool(os.getenv("NOTION_SUMMARY_PAGE")),
+        "NOTION_CHECKLIST_PAGE_set": bool(os.getenv("NOTION_CHECKLIST_PAGE")),
     }
 
 # -----------------------
