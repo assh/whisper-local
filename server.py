@@ -6,7 +6,7 @@ from pydantic import BaseModel, EmailStr
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from passlib.context import CryptContext
 import jwt, os, tempfile, datetime as dt
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Literal
 import httpx
 from dotenv import load_dotenv
 from pathlib import Path
@@ -482,6 +482,128 @@ def notion_checklist_merge(payload: NotionChecklistIn, current: User = Depends(r
         msg = (isinstance(data, dict) and (data.get("message") or data.get("error"))) or "Failed to append checklist to Notion page."
         raise HTTPException(status_code=r.status_code, detail=msg)
     return {"ok": True, "mode": "merge", "pageId": page_id, "added": added, "skipped": skipped}
+
+# -----------------------
+# OpenAI analyse (moved from Next.js /api/analyse)
+# -----------------------
+class AnalyseIn(BaseModel):
+    log: str
+
+class ResultSentiment(BaseModel):
+    label: Literal["Positive", "Neutral", "Negative"]
+    confidence: float
+
+class ResultOut(BaseModel):
+    summary: str
+    blockers: List[str] = []
+    nextSteps: List[str] = []
+    sentiment: ResultSentiment
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+@app.post("/analyse", response_model=ResultOut)
+async def analyse(payload: AnalyseIn):
+    log = (payload.log or "").strip()
+    if not log:
+        raise HTTPException(status_code=400, detail="Missing 'log' text.")
+
+    # Fallback (no key): return deterministic sample so UI still works
+    if not OPENAI_API_KEY:
+        return ResultOut(
+            summary=(
+                "Fixed auth bug, added unit tests, paired on filters, investigated "
+                "flaky CI and a pending sandbox API key."
+            ),
+            blockers=["Payments sandbox API key pending", "CI intermittent failures"],
+            nextSteps=[
+                "Add visual tests",
+                "Wire error tracking",
+                "Follow up with Ops for API key",
+                "Investigate mobile pagination",
+            ],
+            sentiment=ResultSentiment(label="Neutral", confidence=0.7),
+        )
+
+    # Build JSON schema to enforce the exact shape
+    json_schema = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "SprintAnalysis",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "blockers": {"type": "array", "items": {"type": "string"}},
+                    "nextSteps": {"type": "array", "items": {"type": "string"}},
+                    "sentiment": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string", "enum": ["Positive", "Neutral", "Negative"]},
+                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                        },
+                        "required": ["label", "confidence"],
+                        "additionalProperties": False,
+                    },
+                },
+                "required": ["summary", "blockers", "nextSteps", "sentiment"],
+                "additionalProperties": False,
+            },
+            "strict": True,
+        },
+    }
+
+    system_prompt = (
+        "You are a sprint assistant. Given a developer's free-form day log, produce:\n"
+        "- \"summary\": multiple bullet points in the way of meeting minutes type formatting.\n"
+        "- \"blockers\": list of current blockers.\n"
+        "- \"nextSteps\": concrete next actions as short imperatives.\n"
+        "- \"sentiment\": overall mood label (Positive/Neutral/Negative) with confidence 0..1.\n"
+        "Return only valid JSON that matches the schema."
+    )
+
+    body = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Day log:\n{log}"},
+        ],
+        "response_format": json_schema,
+        "temperature": 0.2,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        if r.status_code >= 400:
+            msg = None
+            if isinstance(data, dict):
+                msg = data.get("error") or data.get("message")
+            raise HTTPException(status_code=502, detail=msg or "OpenAI error")
+
+    raw = (data.get("choices", [{}])[0].get("message", {}).get("content") or "{}").strip()
+    try:
+        parsed = ResultOut.model_validate_json(raw)
+    except Exception:
+        # Be forgiving if provider returns slightly off JSON
+        import json
+        try:
+            parsed_obj = json.loads(raw)
+        except Exception:
+            raise HTTPException(status_code=502, detail="Model returned non-JSON content")
+        try:
+            parsed = ResultOut.model_validate(parsed_obj)
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Model JSON failed validation: {e}")
+
+    return parsed
 
 # -----------------------
 # Trello helpers & routes
