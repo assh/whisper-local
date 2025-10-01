@@ -1,0 +1,22 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sprint-api
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env.runtime
+    # If you chose option B (data/ folder):
+    volumes:
+      - ./data:/app/data
+    # If you prefer option A (auth.db in root), use this instead:
+    # volumes:
+    #   - ./:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/openapi.json"]
+      interval: 20s
+      timeout: 3s
+      retries: 5
